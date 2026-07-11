@@ -591,3 +591,363 @@ Run `scripts/fill_form.py input.pdf fields.json output.pdf` to produce output.
 ---
 
 *End of reference. This document reflects Anthropic's published guidance; verify specifics against the official docs before building production workflows, as details evolve.*
+
+---
+---
+
+# PART II — Skills, Tools, Scripts & MCP: Composition Patterns
+
+> **Note on status:** Part I above is drawn closely from Anthropic's published documentation. Part II is **architectural guidance** — a mix of documented facts (the behavior-vs-capability distinction, MCP resource/tool concepts, pre-built skills) and reasoned design patterns (orchestration flows, the PR case study, the tool-vs-skill strategy). Treat the patterns as recommendations to adapt, not as guaranteed platform behavior. Verify specifics against current docs before relying on them in production.
+
+---
+
+## 20. Vocabulary Disambiguation — Four Overlapping Terms
+
+Most confusion in this space comes from the word "tool" meaning at least three different things. Before discussing how they combine, pin down the vocabulary.
+
+### 20.1 Tool (Tool Use / Messages API)
+
+A **tool** is a callable function Claude can invoke, declared to the model as a JSON schema in the Messages API request (or surfaced by a connector). Claude decides whether and when to call it, supplies arguments, and receives a structured result.
+
+```json
+{
+  "name": "create_pull_request",
+  "description": "Create a GitHub PR",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "repo":  {"type": "string"},
+      "title": {"type": "string"},
+      "body":  {"type": "string"}
+    }
+  }
+}
+```
+
+The tool definition lives in the request. The *implementation* lives in your application code (or a remote service); Claude only ever sees the schema and calls it.
+
+### 20.2 Skill Script (bundled executable)
+
+A **script** is an executable file bundled inside a skill's `scripts/` folder. Claude runs it via bash in the sandbox. Its **source is never loaded into context** — only its stdout/stderr and exit code are. It is a *resource of the skill*, not a tool the model "calls" in the Tool Use sense.
+
+```python
+# scripts/analyze_form.py — executed, not loaded
+import pdfplumber, json, sys
+with pdfplumber.open(sys.argv[1]) as pdf:
+    print(json.dumps({"pages": len(pdf.pages)}))
+```
+
+### 20.3 MCP Tool (remote capability)
+
+An **MCP tool** is a callable function exposed by a remote MCP *server* over the Model Context Protocol. Functionally similar to a Tool-Use tool from Claude's perspective (call with args, get structured result), but the capability lives on a server, is discoverable via the protocol, and is portable across MCP-aware platforms. Always reference with a fully qualified name: `ServerName:tool_name`.
+
+### 20.4 MCP Resource (readable data)
+
+An **MCP resource** is **readable content**, not executable code. A server exposes data — a file, a database record, a config, live state — that Claude can *read* on demand. Resources are passive (retrieval), whereas tools are active (execution).
+
+```
+resource://github/repo/myrepo/README.md
+resource://company/policies/remote-work
+resource://database/schemas/users
+```
+
+### 20.5 One-Table Summary
+
+| | Tool (Tool Use) | Skill Script | MCP Tool | MCP Resource |
+|---|---|---|---|---|
+| **Nature** | Callable function | Executable file | Callable function | Readable data |
+| **Active/Passive** | Active (execute) | Active (execute) | Active (execute) | Passive (read) |
+| **Lives where** | API request / app code | Skill `scripts/` folder | Remote MCP server | Remote MCP server |
+| **How Claude uses it** | `tool_use` call | Runs via bash | MCP protocol call | Reads content |
+| **Source in context?** | No (schema only) | No (output only) | No (schema only) | The content is the point |
+| **Returns** | Structured result | stdout/stderr + exit code | Structured result | Raw data (text/JSON/md) |
+| **Portable?** | App-specific | Bundled with skill | Across MCP platforms | Across MCP platforms |
+
+---
+
+## 21. MCP Resources in Depth
+
+### 21.1 What a Resource Is (Readable Data, Not Code)
+
+The single most common misconception is that an MCP resource is "like a script." It is not. A **resource is data Claude reads**; a **script is code Claude runs**. A resource has no execution semantics — reading `resource://company/policies/remote-work` returns the policy text, nothing runs.
+
+### 21.2 Resource vs. Script vs. Tool
+
+- **Resource** — "give me data to read" (passive retrieval).
+- **Script** — "run this code locally" (active, local execution, deterministic).
+- **Tool** — "call this capability" (active, typically remote).
+
+A useful phrasing: resources *inform*, scripts *process*, tools *act*.
+
+### 21.3 When to Expose Data as a Resource
+
+Prefer a resource (over bundling the data in a skill) when:
+
+- The data is **large or dynamic** — serve it on demand rather than embedding it.
+- The data must **stay current** — a resource reads live; a bundled file goes stale.
+- The data is **centralized** — one source of truth many skills/agents can read.
+- The data is **sensitive or access-controlled** — the server governs access.
+
+### 21.4 Resources for Keeping Reference Data Current
+
+The strongest argument for resources over bundled reference files is freshness:
+
+```
+Bundled in a skill:            MCP resource:
+  reference/policy.md            resource://company/policies/remote-work
+  ❌ stale when policy changes    ✅ always the latest from the source system
+  ✅ zero network dependency      ❌ requires the server to be reachable
+```
+
+Rule of thumb: **static, skill-specific knowledge** → bundle as a reference file; **shared, changing, or governed data** → expose as an MCP resource.
+
+---
+
+## 22. The Behavior vs. Capability Model
+
+### 22.1 Skills Change Behavior, Tools/MCP Change Capability
+
+The clarifying axis for the whole ecosystem:
+
+- **Skills change *behavior*** — *how* Claude approaches a task (the procedure, conventions, judgment, sequencing).
+- **Tools / MCP change *capability*** — *what* Claude can reach or do (external functions, services, data).
+
+A skill with no new tools still changes what Claude produces, because it changes method. A tool with no skill adds reach but leaves method to Claude's improvisation.
+
+### 22.2 Why They Compose Rather Than Compete
+
+They operate on different axes, so "skill vs. tool" is usually a false choice. The productive question is *how they layer*:
+
+```
+Skill (behavior)              Tool / MCP (capability)
+     │                                │
+"the right way to do X"       "the ability to reach Y"
+     └──────────── combine ──────────┘
+   A skill instructs Claude when/how to use a tool correctly
+```
+
+### 22.3 The Layered Information Hierarchy (Resource → Script → Tool)
+
+Within a single workflow, the four pieces stack naturally by role:
+
+```
+MCP Resource   →  provides reference data       (read)
+Skill Script   →  processes / validates locally (run)
+MCP Tool       →  performs the remote action    (call)
+Skill          →  orchestrates all of the above (decide sequence)
+```
+
+Example (raising a PR):
+1. **Resource** — read `resource://company/pr-conventions` (labels, template).
+2. **Script** — `format_pr_body.py` builds the description from the template.
+3. **Tool** — `GitHub:create_pull_request(...)` creates the PR.
+4. **Skill** — ties the order together and enforces the checks.
+
+---
+
+## 23. Orchestration Patterns — Skills Driving Scripts + MCP
+
+A skill acts as a **conductor**: it tells Claude when to run a local script and when to invoke a remote tool. Three patterns cover most real workflows.
+
+### 23.1 Pattern A: Script → MCP Tool (Prepare, Then Execute)
+
+Validate/transform locally *before* touching a remote API, so errors are caught cheaply and the remote call is always well-formed.
+
+```markdown
+## Create issue (validated)
+1. Run scripts/validate_issue_data.py   # check + normalize fields
+   → on failure: STOP, do not call the tool
+2. Call GitHub:create_issue(...validated fields...)
+```
+
+Why: the local script fails fast and free; the remote call only fires on clean input.
+
+### 23.2 Pattern B: MCP Tool → Script (Execute, Then Process)
+
+Call the remote capability first, then post-process the raw result locally into the shape you actually want.
+
+```markdown
+## Database report
+1. Call Database:get_active_users(department="Engineering")   # raw records
+2. Run scripts/format_user_report.py                          # → markdown table + summary
+3. Run scripts/save_report.py report.md
+```
+
+Why: remote systems return raw data; local scripts format, summarize, and persist it without extra token cost.
+
+### 23.3 Pattern C: Script → MCP → Script (Validate, Execute, Verify)
+
+The most robust pattern for high-stakes or batch operations — the "plan-validate-execute" idea from §8 extended across the local/remote boundary.
+
+```markdown
+## Bulk update (safe)
+1. Run scripts/generate_update_plan.py   → updates.json
+2. Run scripts/validate_plan.py updates.json   # conflicts? dangerous ops?
+   → on failure: STOP
+3. Call GitHub:bulk_update(changes=updates.json)   # execute only if valid
+4. Run scripts/verify_updates.py   # confirm applied + write audit log
+```
+
+Why: validation catches problems before execution; verification confirms success after — with a machine-checkable audit trail on both ends.
+
+### 23.4 How Claude Executes a Multi-Step Skill Sequence
+
+Mechanically, the skill body drives an interleaving of bash executions and tool calls:
+
+```
+1. bash:  python scripts/validate.py input.json  →  stdout: {"status":"valid", ...}
+2. tool:  GitHub:create_pull_request(...)         →  {"url": "https://github.com/..."}
+3. bash:  python scripts/notify.py <url>          →  stdout: "✓ notified"
+```
+
+Each step's output becomes available context for the next. The skill's job is purely to fix the order and the guard conditions ("only proceed if valid").
+
+---
+
+## 24. Case Study — Raising a PR Three Ways
+
+### 24.1 Option A: Tool Alone
+
+Claude calls `create_pull_request` directly with whatever parameters it infers.
+
+- **Pros:** minimal overhead, one step, fast.
+- **Cons:** no team conventions, no pre-flight validation, inconsistent branch/label/description formatting, and you re-supply the procedure ("run tests first, add label X, link the issue") on every request.
+
+### 24.2 Option B: Skill Alone (CLI/API)
+
+A skill encodes the full procedure but performs the creation itself via `git`/`gh` CLI or raw API calls.
+
+- **Pros:** encodes org procedure; validation steps included; consistent output.
+- **Cons:** fragile — depends on specific CLI tools/versions being present; error handling is all manual; no standardized, portable capability layer.
+
+### 24.3 Option C: Hybrid (Skill + Tool) — Recommended
+
+The skill encodes the *procedure*; a tool (ideally via MCP) provides the *capability*.
+
+```markdown
+# Secure PR Creation Skill
+1. Run scripts/validate_pr_readiness.py   # branch clean, tests pass, style ok
+   → fail: STOP
+2. Run scripts/format_pr_description.py   # issue link + checklist + sections
+3. Call GitHub:create_pull_request(title, body, labels, reviewers)
+4. Run scripts/notify_team.py <PR_URL>    # Slack + board + email
+```
+
+- **Pros:** validation before action, consistent formatting/labels, robust error handling, procedure defined once and reused, lower per-use token cost.
+- **Cons:** slightly higher standing metadata cost (acceptable).
+
+### 24.4 Decision Table: Which Option Fits
+
+| Question | If "yes" → |
+|---|---|
+| Team has PR conventions (naming, labels, reviewers, format)? | Hybrid |
+| Want validation (tests pass, branch clean) before creating? | Hybrid |
+| Repeated task you'd otherwise re-explain each time? | Hybrid |
+| Truly one-off, "just call the API with these params"? | Tool alone |
+| No org-specific procedure and no checks needed? | Tool alone |
+
+### 24.5 When the Skill Pays for Itself
+
+If you currently describe the PR procedure by hand in prompts, the hybrid skill removes that repetition *and* makes results consistent. In practice it breaks even after only a few PRs — roughly the third invocation — and every one after that is pure savings in tokens, consistency, and avoided mistakes.
+
+---
+
+## 25. Tool Use vs. Skills — The Strategic Choice
+
+> Here "tools" means Tool Use / bundled scripts — **not** MCP specifically.
+
+### 25.1 Two Approaches Compared
+
+| Aspect | Direct Tools | Skills |
+|---|---|---|
+| What Claude sees | Tool schema (name, desc, params) | Instructions + procedure + scripts |
+| Who decides the procedure | Claude, each time | The skill, once |
+| Validation | Ad hoc; errors surface remotely | Local scripts check first |
+| Consistency | Varies per invocation | Same every time |
+| Per-use token cost | High (procedure re-supplied) | Low (skill body loads on demand) |
+| Reusability | One-off pattern | Teachable, repeatable |
+| Org procedures | Re-invented each time | Encoded and enforced |
+| Best for | Simple, one-step ops | Complex, multi-step procedures |
+
+### 25.2 Tools as Building Blocks, Skills as Complete Solutions
+
+- **Tool Use** gives Claude *capabilities* — building blocks.
+- **A Skill** gives Claude a *procedure* — a complete solution assembled from those blocks plus validation and conventions.
+
+Analogy: a tool is a hammer and nails; a skill is the assembly manual that says how to build the shelf correctly, in what order, with which checks.
+
+### 25.3 The Six-Month Maintenance Perspective
+
+- **Tools only:** the same procedure gets re-typed into prompts dozens of times, drifting and occasionally skipping steps. Maintenance is scattered across every prompt that mentions it.
+- **Skills:** the procedure lives in one file. Update it once and every future invocation follows the new version. Maintenance is centralized.
+
+### 25.4 Cost-Benefit & ROI Framing
+
+| Factor | Tools | Skills |
+|---|---|---|
+| Setup cost | Low | Medium (write SKILL.md + scripts) |
+| Ongoing maintenance | High (repeated everywhere) | Low (one place) |
+| Token cost per use | High | Low |
+| Consistency | Low | High |
+| Reliability | Low (no validation) | High (validation + feedback loops) |
+| ROI | Even after ~5 uses | Positive from first repeat |
+
+### 25.5 Can Scripts Replace Tools? (Technically Yes, Practically No)
+
+You *could* implement every capability as a local script (e.g. shelling out to `gh pr create`). It works, but it sacrifices what tools/MCP give you: standardized capability discovery, remote service integration, cross-platform portability, and clean separation between local processing and remote action. The better division of labor is: **scripts for local processing and validation; tools/MCP for remote capabilities.**
+
+---
+
+## 26. Recommended Architecture Stack
+
+### 26.1 The Optimal Layering
+
+```
+Skill  (procedure / orchestration)
+  ├─ Scripts        → local processing, validation, verification
+  ├─ MCP Tools      → remote capabilities / actions
+  └─ MCP Resources  → live reference data / context
+     (plus bundled reference files for static, skill-specific knowledge)
+```
+
+The skill decides sequence and guards; scripts do fast local work for free; MCP tools reach out to act; MCP resources supply current data.
+
+### 26.2 Anti-Patterns at the Architecture Level
+
+- Bare tool definitions scattered across many requests, with the procedure re-explained in prose each time.
+- Encoding procedures in prompts instead of a skill (drift, inconsistency, token waste).
+- Calling a remote tool with no local validation first (errors surface late and expensively).
+- Bundling data that changes often as a static reference file instead of an MCP resource (staleness).
+- Reimplementing remote capabilities as local scripts purely to avoid MCP (loses portability and discovery).
+
+### 26.3 Decision Flowchart: Tool vs. Script vs. Skill vs. Resource
+
+```
+Need reference DATA?
+  ├─ changes often / shared / governed → MCP Resource
+  └─ static & skill-specific           → bundled reference file
+
+Need to DO something?
+  ├─ deterministic, local, no remote service → Skill Script
+  ├─ remote service / external capability    → MCP Tool (or Tool Use)
+  └─ multi-step / needs conventions + checks  → Skill (orchestrating the above)
+
+Truly one-step, one-off, no procedure? → Tool alone is fine.
+```
+
+---
+
+## Appendix D — Terminology Cross-Reference Table
+
+| Term | What it is | Where it lives | Who invokes / accesses | In context? | Use when |
+|---|---|---|---|---|---|
+| **Tool (Tool Use)** | Callable function | API request / app code | Claude via `tool_use` | Schema only | One-step remote/app capability |
+| **Skill Script** | Executable file | Skill `scripts/` | Claude via bash | Output only | Deterministic local work |
+| **MCP Tool** | Remote callable function | MCP server | Claude via MCP protocol | Schema only | Portable remote capability |
+| **MCP Resource** | Readable data | MCP server | Claude reads it | The content itself | Live / shared / governed data |
+| **Skill** | Procedure + resources | Skill folder | Auto-triggered by task match | Metadata always; body on trigger | Multi-step, conventions, judgment |
+| **Reference file** | Static doc in a skill | Skill folder | Claude reads on demand | Only when read | Static, skill-specific knowledge |
+
+---
+
+*End of Part II. This part is architectural guidance rather than official specification; validate patterns against Anthropic's current documentation before production use.*
